@@ -39,24 +39,52 @@ public class YSMFolderDeserializer implements AutoCloseable {
 
     private final Map<String, byte[]> inMemoryFiles;
 
+    /** 单个模型资源文件的大小上限（字节）。超限视为垃圾/损坏资源，跳过读取以避免内存暴涨或卡顿。 */
+    private static final long MAX_RESOURCE_BYTES = 256L * 1024L * 1024L;
+
     public YSMFolderDeserializer(Path sourcePath) throws IOException {
         if (!Files.exists(sourcePath)) {
             throw new FileNotFoundException("Model source not found: " + sourcePath);
         }
 
-        this.inMemoryFiles = null;
-
         if (Files.isDirectory(sourcePath)) {
+            this.inMemoryFiles = null;
             this.rootPath = sourcePath;
             this.zipFileSystem = null;
         } else if (sourcePath.toString().endsWith(".zip") || sourcePath.toString().endsWith(".ysm")) {
             URI uri = URI.create("jar:" + sourcePath.toUri());
-            this.zipFileSystem = FileSystems.newFileSystem(uri, Collections.emptyMap());
-            this.rootPath = resolveArchiveModelRoot(this.zipFileSystem.getPath("/"));
+            java.nio.file.FileSystem openedFs = null;
+            Path openedRoot = null;
+            try {
+                openedFs = FileSystems.newFileSystem(uri, Collections.emptyMap());
+                openedRoot = resolveArchiveModelRoot(openedFs.getPath("/"));
+            } catch (java.util.zip.ZipException zipException) {
+                // 中文 Windows 压缩工具生成的 zip 常用 GBK 编码条目名，jdk.zipfs 按 UTF-8
+                // 解码会抛 "invalid CEN header (bad entry name)"。回退用 ZipFile + GBK 读取。
+                System.err.println("[SM] Warning: Zip entry names are not UTF-8, retrying with GBK: " + sourcePath);
+            }
+            if (openedFs != null) {
+                this.zipFileSystem = openedFs;
+                this.rootPath = openedRoot;
+                this.inMemoryFiles = null;
+            } else {
+                this.zipFileSystem = null;
+                this.rootPath = null;
+                this.inMemoryFiles = readZipEntries(sourcePath, java.nio.charset.Charset.forName("GBK"));
+            }
         } else {
             throw new IllegalArgumentException("Unsupported file type. Expected directory or .zip");
         }
 
+        this.model = new RawYsmModel();
+        this.model.formatVersion = 65535;
+    }
+
+    /** 仅用于静态探测（parseBedrockGeometry 等不需要读取任何 zip/目录资源）。 */
+    private YSMFolderDeserializer() {
+        this.rootPath = null;
+        this.zipFileSystem = null;
+        this.inMemoryFiles = null;
         this.model = new RawYsmModel();
         this.model.formatVersion = 65535;
     }
@@ -110,6 +138,11 @@ public class YSMFolderDeserializer implements AutoCloseable {
             if (inMemoryFiles == null) {
                 Path target = resolveResourcePath(normalizedPath);
                 if (Files.exists(target) && Files.isRegularFile(target)) {
+                    long size = Files.size(target);
+                    if (size > MAX_RESOURCE_BYTES) {
+                        System.err.println("[SM] Warning: Skipping oversized model resource (" + size + " bytes): " + relativePath);
+                        return null;
+                    }
                     data = Files.readAllBytes(target);
                 }
             } else {
@@ -523,12 +556,23 @@ public class YSMFolderDeserializer implements AutoCloseable {
     }
 
     private RawYsmModel.RawGeometry parseGeometry(byte[] data, int modelType) {
+        return parseGeometry(data, modelType, null);
+    }
+
+    /**
+     * 解析 Bedrock {@code minecraft:geometry} JSON。
+     *
+     * @param identifier 非空时按 {@code description.identifier} 选择几何（支持
+     *                   {@code geometry.xxx} 与 {@code xxx} 两种写法，大小写不敏感）；
+     *                   为空或找不到时回退到第一个（与旧行为一致，YSM 包不受影响）。
+     */
+    private RawYsmModel.RawGeometry parseGeometry(byte[] data, int modelType, String identifier) {
         String json = new String(data, StandardCharsets.UTF_8);
         JsonObject root = JsonParser.parseString(json).getAsJsonObject();
         JsonArray geometries = root.has("minecraft:geometry") ? root.getAsJsonArray("minecraft:geometry") : null;
         if (geometries == null || geometries.isEmpty()) return new RawYsmModel.RawGeometry();
 
-        JsonObject geoObj = geometries.get(0).getAsJsonObject();
+        JsonObject geoObj = selectGeometry(geometries, identifier);
         RawYsmModel.RawGeometry geo = new RawYsmModel.RawGeometry();
         geo.sha256 = sha256Hex(data);
 
@@ -649,6 +693,64 @@ public class YSMFolderDeserializer implements AutoCloseable {
             }
         }
         return geo;
+    }
+
+    /** 按 identifier 选择几何；identifier 为空或未命中时回退到第一个。 */
+    private static JsonObject selectGeometry(JsonArray geometries, String identifier) {
+        if (identifier != null && !identifier.isEmpty()) {
+            String want = identifier.trim();
+            String wantWithPrefix = want.startsWith("geometry.") ? want : "geometry." + want;
+            for (JsonElement element : geometries) {
+                if (!element.isJsonObject()) continue;
+                JsonObject candidate = element.getAsJsonObject();
+                if (!candidate.has("description") || !candidate.get("description").isJsonObject()) continue;
+                String id = getJsonString(candidate.getAsJsonObject("description").get("identifier"));
+                if (id == null || id.isEmpty()) continue;
+                if (id.equalsIgnoreCase(want) || id.equalsIgnoreCase(wantWithPrefix)
+                        || id.endsWith("." + want)) {
+                    return candidate;
+                }
+            }
+        }
+        return geometries.get(0).getAsJsonObject();
+    }
+
+    /**
+     * 静态入口：解析裸 Bedrock geo JSON（供 Bedrock 直读导入用，不依赖任何 zip/目录资源）。
+     *
+     * @param identifier 按 {@code description.identifier} 选择几何，可为 null（取第一个）。
+     */
+    public static RawYsmModel.RawGeometry parseBedrockGeometry(byte[] data, String identifier) {
+        if (data == null || data.length == 0) {
+            return new RawYsmModel.RawGeometry();
+        }
+        try (YSMFolderDeserializer probe = new YSMFolderDeserializer()) {
+            return probe.parseGeometry(data, 1, identifier);
+        } catch (Exception e) {
+            System.err.println("[SM] Failed to parse Bedrock geometry: " + e);
+            return new RawYsmModel.RawGeometry();
+        }
+    }
+
+    /** 静态入口：把 PNG 等图像字节包装成 RawTexture（供 Bedrock 直读导入用）。 */
+    public static RawYsmModel.RawTexture parseBedrockTexture(byte[] imageBytes, String name) {
+        RawYsmModel.RawTexture texture = new RawYsmModel.RawTexture();
+        if (imageBytes == null || imageBytes.length == 0) {
+            return texture;
+        }
+        try (YSMFolderDeserializer probe = new YSMFolderDeserializer()) {
+            ImageMeta meta = probe.parseImageMeta(imageBytes, name);
+            texture.hash = sha256Hex(imageBytes);
+            texture.width = meta.width();
+            texture.height = meta.height();
+            texture.imageFormat = meta.format();
+            texture.name = name;
+            texture.data = imageBytes;
+            texture.unknownFlag = 1;
+        } catch (Exception e) {
+            System.err.println("[SM] Failed to parse Bedrock texture " + name + ": " + e);
+        }
+        return texture;
     }
 
     private void bakeFaceToRaw(RawYsmModel.RawCube cube, JsonObject uvObj, String faceType, String uvFaceName, boolean mirror, float x, float y, float z, float w, float h, float d, float tw, float th, Vector3f rawNormal, Matrix4f cubeBakeMat, Matrix3f cubeNormalMat) {
@@ -944,21 +1046,36 @@ public class YSMFolderDeserializer implements AutoCloseable {
     private void parseGlobalResources() {
         if (inMemoryFiles != null) {
             for (Map.Entry<String, byte[]> entry : inMemoryFiles.entrySet()) {
-                processGlobalResourceFile(entry.getKey(), entry.getValue());
+                if (isGlobalResource(entry.getKey())) {
+                    processGlobalResourceFile(entry.getKey(), entry.getValue());
+                }
             }
         } else {
             try (Stream<Path> stream = Files.walk(rootPath)) {
-                stream.filter(Files::isRegularFile).forEach(path -> {
-                    String relativePath = rootPath.relativize(path).toString().replace('\\', '/');
-                    byte[] data = readResource(relativePath);
-                    if (data != null) {
-                        processGlobalResourceFile(relativePath, data);
-                    }
-                });
+                stream.filter(Files::isRegularFile)
+                        .filter(path -> isGlobalResource(rootPath.relativize(path).toString().replace('\\', '/')))
+                        .forEach(path -> {
+                            String relativePath = rootPath.relativize(path).toString().replace('\\', '/');
+                            byte[] data = readResource(relativePath);
+                            if (data != null) {
+                                processGlobalResourceFile(relativePath, data);
+                            }
+                        });
             } catch (IOException e) {
                 System.err.println("[SM] Warning: Failed to scan global resources. " + e.getMessage());
             }
         }
+    }
+
+    /**
+     * 全局资源白名单：只有 sounds/lang/functions 目录（及任意位置的 .ogg）里的文件
+     * 才会被读取并嵌入模型，模型文件夹里的其它无关文件（说明文档、图片、视频等）直接跳过，
+     * 避免把大文件整体读入内存导致卡顿/OOM。与 processGlobalResourceFile 的判定条件保持一致。
+     */
+    private static boolean isGlobalResource(String relativePath) {
+        if (relativePath == null) return false;
+        return relativePath.startsWith("sounds/") || relativePath.endsWith(".ogg")
+                || relativePath.startsWith("lang/") || relativePath.startsWith("functions/");
     }
 
     private void processGlobalResourceFile(String relativePath, byte[] data) {
@@ -1257,6 +1374,9 @@ public class YSMFolderDeserializer implements AutoCloseable {
                 String animKey = fileName.substring(0, fileName.length() - ".animation.json".length());
                 raf.animType = getAnimTypeFromKey(animKey);
                 model.mainEntity.animationFiles.put(animKey, raf);
+                if("extra".equals(animKey)) {
+                    raf.animations.keySet().forEach(animName -> model.properties.extraAnimations.put(animName, animName));
+                }
             }
         }
 
@@ -1290,6 +1410,76 @@ public class YSMFolderDeserializer implements AutoCloseable {
 
             model.projectiles.put("arrow", arrowSub);
         }
+    }
+
+    private static Map<String, byte[]> readZipEntries(Path sourcePath, java.nio.charset.Charset charset) throws IOException {
+        Map<String, byte[]> rawEntries = new LinkedHashMap<>();
+        try (java.util.zip.ZipFile zipFile = new java.util.zip.ZipFile(sourcePath.toFile(), charset)) {
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> enumeration = zipFile.entries();
+            while (enumeration.hasMoreElements()) {
+                java.util.zip.ZipEntry entry = enumeration.nextElement();
+                if (entry.isDirectory()) {
+                    continue;
+                }
+                try (java.io.InputStream input = zipFile.getInputStream(entry)) {
+                    byte[] bytes = input.readNBytes((int) Math.min(MAX_RESOURCE_BYTES + 1, Integer.MAX_VALUE));
+                    if (bytes.length > MAX_RESOURCE_BYTES) {
+                        System.err.println("[SM] Warning: Skipping oversized zip entry (" + bytes.length + " bytes): " + entry.getName());
+                        continue;
+                    }
+                    rawEntries.putIfAbsent(entry.getName(), bytes);
+                }
+            }
+        }
+        // 与 resolveArchiveModelRoot 一致的模型根目录探测（字符串层面）
+        String rootPrefix = detectInMemoryModelRoot(rawEntries.keySet());
+        if (rootPrefix == null) {
+            return rawEntries;
+        }
+        Map<String, byte[]> entries = new LinkedHashMap<>();
+        for (Map.Entry<String, byte[]> entry : rawEntries.entrySet()) {
+            String name = entry.getKey();
+            String stripped = name;
+            if (!rootPrefix.isEmpty() && name.startsWith(rootPrefix)) {
+                stripped = name.substring(rootPrefix.length());
+            }
+            String normalized = normalizeResourceKey(stripped);
+            if (!normalized.isEmpty()) {
+                entries.putIfAbsent(normalized, entry.getValue());
+            }
+        }
+        return entries;
+    }
+
+    private static String detectInMemoryModelRoot(java.util.Set<String> names) {
+        java.util.Set<String> normalized = new java.util.HashSet<>();
+        for (String name : names) {
+            normalized.add(normalizeResourceKey(name));
+        }
+        if (normalized.contains("ysm.json") || (normalized.contains("main.json") && normalized.contains("arm.json"))) {
+            return "";
+        }
+        String detected = null;
+        for (String name : names) {
+            int slash = name.indexOf('/');
+            if (slash <= 0) {
+                continue;
+            }
+            String segment = name.substring(0, slash);
+            String folderKey = normalizeResourceKey(segment);
+            boolean modelFolder = normalized.contains(folderKey + "/ysm.json")
+                    || (normalized.contains(folderKey + "/main.json") && normalized.contains(folderKey + "/arm.json"));
+            if (!modelFolder) {
+                continue;
+            }
+            if (detected == null) {
+                detected = segment;
+            } else if (!normalizeResourceKey(segment).equals(normalizeResourceKey(detected))) {
+                // 多个不同的模型目录 → 与 resolveArchiveModelRoot 一致，以整个压缩包为根
+                return null;
+            }
+        }
+        return detected;
     }
 
     public static boolean isModelFolder(Path dir) {

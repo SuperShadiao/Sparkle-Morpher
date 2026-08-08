@@ -23,8 +23,16 @@ public class Vector3v {
     }
 
     public Vector3f eval(ExpressionEvaluator<?> evaluator) {
-        return this.vector.set(x.evalAsFloat(evaluator),
-                y.evalAsFloat(evaluator),
-                z.evalAsFloat(evaluator));
+        if (evaluator == null) {
+            // 无 evaluator 路径（如 StepKeyFrame 单元测试/非 Molang 键弗段）保持旧行为
+            return this.vector.set(x.evalAsFloat(null), y.evalAsFloat(null), z.evalAsFloat(null));
+        }
+        evaluator.setCurrentAxis(0);
+        float vx = x.evalAsFloat(evaluator);
+        evaluator.setCurrentAxis(1);
+        float vy = y.evalAsFloat(evaluator);
+        evaluator.setCurrentAxis(2);
+        float vz = z.evalAsFloat(evaluator);
+        return this.vector.set(vx, vy, vz);
     }
 }

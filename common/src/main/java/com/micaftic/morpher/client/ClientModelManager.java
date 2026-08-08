@@ -2,11 +2,13 @@ package com.micaftic.morpher.client;
 
 import com.micaftic.morpher.RuntimeAccelerationLoader;
 import com.micaftic.morpher.YesSteveModel;
+import com.micaftic.morpher.client.animation.BedrockAnimationMapping;
 import com.micaftic.morpher.audio.AudioStreamCache;
 import com.micaftic.morpher.audio.AudioTrackData;
 import com.micaftic.morpher.capability.ModelInfoCapability;
 import com.micaftic.morpher.capability.PlayerCapability;
 import com.micaftic.morpher.client.entity.EntityRenderCache;
+import com.micaftic.morpher.client.compat.ClientRenderCompatibilityRegistry;
 import com.micaftic.morpher.client.gui.IGuiWidget;
 import com.micaftic.morpher.client.gui.metadata.ModelDisplayAssets;
 import com.micaftic.morpher.client.model.ModelAssembly;
@@ -158,6 +160,8 @@ public class ClientModelManager {
             }
         });
     }
+
+    private static final long MAX_LOCAL_MODEL_FILE_BYTES = 512L * 1024L * 1024L;
 
     private static final Map<UUID, ServerModelContext> serverModels = new ConcurrentHashMap<>();
 
@@ -329,6 +333,13 @@ public class ClientModelManager {
     private record ModelHash(long hash1, long hash2) {
     }
 
+    /**
+     * 服务器清单中的单个模型及其对应的本地缓存文件。
+     * 主线程只负责收集,文件内容校验全部在后台线程完成。
+     */
+    private record CacheVerificationEntry(ServerModelContext ctx, ModelHash hash, @Nullable File cachedFile) {
+    }
+
     private static final List<ModelHash> cachedModelHashes = new ArrayList<>();
 
     private static void handlePacket03(YSMByteBuf buf) throws Exception {
@@ -347,8 +358,9 @@ public class ClientModelManager {
         if (!cacheDir.exists()) cacheDir.mkdirs();
         YSMClientCache.prepareCacheDirectory(cacheDir);
 
+        // 仅列目录 + 文件名解密(轻量,无文件内容 IO);完整校验在后台线程完成
         Map<UUID, File> localCacheMap = YSMClientCache.buildCacheIndex(cacheDir, clientKey);
-        List<ModelHash> modelsToRequest = new ArrayList<>();
+        List<CacheVerificationEntry> cacheEntries = new ArrayList<>();
         Set<UUID> expectedCacheModels = new HashSet<>();
 
         int unkSize = buf.readVarInt();
@@ -358,9 +370,6 @@ public class ClientModelManager {
         syncCompletionScheduled.set(false);
 
         Set<String> validServerModelIds = new HashSet<>();
-        List<String> previousModelIds = new ArrayList<>();
-        List<String> updatedModelIds = new ArrayList<>();
-        List<Boolean> isModelReadyList = new ArrayList<>();
 
         for (int i = 0; i < unkSize; i++) {
             long hash1 = buf.readVarLong();
@@ -371,8 +380,7 @@ public class ClientModelManager {
             String modelId = buf.readString();
             boolean isAuth = buf.readVarInt() == 1;// isAuth
             int isCustomSkinModel = buf.readVarInt();// is default
-//            System.out.println("Received model hash: " + mHash + ", id: " + modelId + ", unk1: " + isAuth + ", unk2: " + isCustomSkinModel);
-            int version = buf.readVarInt(); // 鐎甸€涚艾閺傚洣娆㈡径瑙勬弓閸旂姴鐦戦惃鍕侀崹瀣剁礉娑?5535
+            int version = buf.readVarInt();
 
             ServerModelContext ctx = new ServerModelContext(hash1, hash2, modelId, isAuth, isCustomSkinModel, version);
             serverModels.put(ctx.uuid, ctx);
@@ -384,56 +392,14 @@ public class ClientModelManager {
                 continue;
             }
 
+            // 主线程只登记缓存路径与懒加载源(纯内存操作),绝不读取缓存文件内容。
             File cachedFile = localCacheMap.get(ctx.uuid);
             if (cachedFile != null) {
                 cachedModelFiles.put(ctx.modelKey, cachedFile);
                 registerRemoteLazySource(ctx.modelKey, cachedFile.toPath(), clientKey, ctx.isAuth);
             }
-            boolean isFileValid = YSMClientCache.verifyFileContent(cachedFile, hash1, hash2);
-
-            boolean alreadyInMemory = modelAssemblyMap != null && modelAssemblyMap.containsKey(ctx.modelKey);
-
-            if (isFileValid) {
-                YesSteveModel.LOGGER.info("[SM] Cache HIT & Validated: " + ctx.uuid);
-                if (alreadyInMemory) {
-                    previousModelIds.add(ctx.modelKey);
-                    updatedModelIds.add(ctx.modelKey);
-                    isModelReadyList.add(isAuth);
-                    markSyncModelProcessed();
-                } else if (isLazyModelLoading()) {
-                    YesSteveModel.LOGGER.info("[SM] Deferred cached model until first use: {}", ctx.modelKey);
-                    markSyncModelProcessed();
-                } else {
-                    // 閸涙垝鑵戠紓鎾崇摠
-                    pendingModelsCount.incrementAndGet();
-                    submitModelTask(() -> {
-                        try {
-                            if (clientKey == null) return;
-                            byte[] fileBytes = Files.readAllBytes(cachedFile.toPath());
-                            ModelMemoryProfiler.logBytes("cache-read", modelId, fileBytes);
-                            byte[] decompressed = YsmCrypt.readInPlace(fileBytes, clientKey);
-                            ModelMemoryProfiler.logBytes("cache-decrypted", modelId, decompressed);
-                            fileBytes = null;
-                            parseAndLoadModel(decompressed, ctx.modelKey, isAuth);
-                            decompressed = null;
-                            ModelMemoryProfiler.log("cache-parsed", modelId);
-                        } catch (Exception e) {
-                            YesSteveModel.LOGGER.error("[SM] Failed to parse and load cached model: " + modelId, e);
-                            YSMClientCache.deleteCacheFile(cachedFile);
-                        } finally {
-                            finishPendingModelLoad();
-                        }
-                    });
-                }
-            } else {
-                YesSteveModel.LOGGER.info("[SM] Cache MISS or Invalid: " + ctx.uuid + " -> Requesting...");
-                YSMClientCache.deleteCacheFile(cachedFile);
-                modelsToRequest.add(mHash);
-                pendingModelsCount.incrementAndGet();
-            }
+            cacheEntries.add(new CacheVerificationEntry(ctx, mHash, cachedFile));
         }
-
-        YSMClientCache.cleanupCacheDirectory(cacheDir, expectedCacheModels, clientKey);
 
         int unkSize2 = buf.readVarInt();
         List<ModelPackData> parsedPacks = new ArrayList<>();
@@ -480,57 +446,144 @@ public class ClientModelManager {
             onModelPacksReceived(parsedPacks.toArray(new ModelPackData[0]));
         }
 
-        List<String> modelsToRemove = new ArrayList<>();
-        if (modelAssemblyMap != null) {
-            for (String loadedId : modelAssemblyMap.keySet()) {
-                if ("default".equals(loadedId)) continue;
+        // ---- 缓存校验全部移到后台线程:主线程不再对缓存文件做任何读盘+全文件哈希 ----
+        // 原来的主线程同步校验(verifyFileContent = 全文件读取 + CityHash)会让进入服务器瞬间
+        // 卡死(模型越多越大越明显)。现在主线程只解析包结构,校验/清理/决策在后台完成,
+        // 结果回到主线程发送请求清单并收尾。
+        final int taskGeneration = MODEL_TASK_GENERATION.get();
+        submitModelTask(() -> {
+            final List<ModelHash> modelsToRequest = new ArrayList<>();
+            final List<String> previousModelIds = new ArrayList<>();
+            final List<String> updatedModelIds = new ArrayList<>();
+            final List<Boolean> isModelReadyList = new ArrayList<>();
+            try {
+                for (CacheVerificationEntry entry : cacheEntries) {
+                    if (taskGeneration != MODEL_TASK_GENERATION.get()) {
+                        return;
+                    }
+                    ServerModelContext ctx = entry.ctx;
+                    File cachedFile = entry.cachedFile;
+                    boolean isFileValid = cachedFile != null
+                            && YSMClientCache.verifyFileContent(cachedFile, entry.hash.hash1, entry.hash.hash2);
+                    if (taskGeneration != MODEL_TASK_GENERATION.get()) {
+                        return;
+                    }
 
-                if (!validServerModelIds.contains(loadedId)) {
-                    modelsToRemove.add(loadedId);
-                } else if (modelsToRequest.stream().anyMatch(h -> serverModels.containsKey(new UUID(h.hash1, h.hash2)) && serverModels.get(new UUID(h.hash1, h.hash2)).modelKey.equals(loadedId))) {
-                    modelsToRemove.add(loadedId);
+                    boolean alreadyInMemory = modelAssemblyMap != null && modelAssemblyMap.containsKey(ctx.modelKey);
+
+                    if (isFileValid) {
+                        YesSteveModel.LOGGER.info("[SM] Cache HIT & Validated: " + ctx.uuid);
+                        if (alreadyInMemory) {
+                            previousModelIds.add(ctx.modelKey);
+                            updatedModelIds.add(ctx.modelKey);
+                            isModelReadyList.add(ctx.isAuth);
+                            markSyncModelProcessed();
+                        } else if (isLazyModelLoading()) {
+                            YesSteveModel.LOGGER.info("[SM] Deferred cached model until first use: {}", ctx.modelKey);
+                            markSyncModelProcessed();
+                        } else {
+                            // 非懒加载模式:后台解析缓存文件
+                            pendingModelsCount.incrementAndGet();
+                            submitModelTask(() -> {
+                                try {
+                                    if (clientKey == null) return;
+                                    byte[] fileBytes = Files.readAllBytes(cachedFile.toPath());
+                                    ModelMemoryProfiler.logBytes("cache-read", ctx.modelId, fileBytes);
+                                    byte[] decompressed = YsmCrypt.readInPlace(fileBytes, clientKey);
+                                    ModelMemoryProfiler.logBytes("cache-decrypted", ctx.modelId, decompressed);
+                                    fileBytes = null;
+                                    parseAndLoadModel(decompressed, ctx.modelKey, ctx.isAuth);
+                                    decompressed = null;
+                                    ModelMemoryProfiler.log("cache-parsed", ctx.modelId);
+                                } catch (Exception e) {
+                                    YesSteveModel.LOGGER.error("[SM] Failed to parse and load cached model: " + ctx.modelId, e);
+                                    YSMClientCache.deleteCacheFile(cachedFile);
+                                } finally {
+                                    finishPendingModelLoad();
+                                }
+                            });
+                        }
+                    } else {
+                        YesSteveModel.LOGGER.info("[SM] Cache MISS or Invalid: " + ctx.uuid + " -> Requesting...");
+                        if (cachedFile != null) {
+                            YSMClientCache.deleteCacheFile(cachedFile);
+                        }
+                        modelsToRequest.add(entry.hash);
+                        pendingModelsCount.incrementAndGet();
+                    }
+                    markSyncActivity();
                 }
+            } catch (Exception e) {
+                YesSteveModel.LOGGER.error("[SM] Failed to verify cached models on background thread", e);
             }
-        }
-
-        if (!modelsToRemove.isEmpty() || !previousModelIds.isEmpty()) {
-            boolean[] readyArr = new boolean[isModelReadyList.size()];
-            for (int j = 0; j < isModelReadyList.size(); j++) {
-                readyArr[j] = isModelReadyList.get(j);
+            try {
+                YSMClientCache.cleanupCacheDirectory(cacheDir, expectedCacheModels, clientKey);
+            } catch (Exception e) {
+                YesSteveModel.LOGGER.warn("[SM] Failed to cleanup cache directory", e);
             }
+            markSyncActivity();
 
-            onModelContextsUpdated(
-                    modelsToRemove.isEmpty() ? null : modelsToRemove.toArray(new String[0]),
-                    previousModelIds.isEmpty() ? null : previousModelIds.toArray(new String[0]),
-                    updatedModelIds.isEmpty() ? null : updatedModelIds.toArray(new String[0]),
-                    readyArr
-            );
-            YesSteveModel.LOGGER.info("[SM] Cleaned up {} outdated models and updated {} existing models during sync.", modelsToRemove.size(), previousModelIds.size());
-        }
+            // 回到主线程:发送请求清单 + 清理过期模型 + 标记清单处理完成
+            ((Executor) Minecraft.getInstance()).execute(() -> {
+                if (taskGeneration != MODEL_TASK_GENERATION.get()) {
+                    return;
+                }
+                try {
+                List<String> modelsToRemove = new ArrayList<>();
+                    if (modelAssemblyMap != null) {
+                        for (String loadedId : modelAssemblyMap.keySet()) {
+                            if ("default".equals(loadedId)) continue;
 
-        syncStep = 3;
-        markSyncActivity();
+                            if (!validServerModelIds.contains(loadedId)) {
+                                modelsToRemove.add(loadedId);
+                            } else if (modelsToRequest.stream().anyMatch(h -> serverModels.containsKey(new UUID(h.hash1, h.hash2)) && serverModels.get(new UUID(h.hash1, h.hash2)).modelKey.equals(loadedId))) {
+                                modelsToRemove.add(loadedId);
+                            }
+                        }
+                    }
 
-        int garbageLen = 16 + SECURE_RANDOM.nextInt(48);
-        byte[] garbage = new byte[garbageLen];
-        SECURE_RANDOM.nextBytes(garbage);
+                    if (!modelsToRemove.isEmpty() || !previousModelIds.isEmpty()) {
+                        boolean[] readyArr = new boolean[isModelReadyList.size()];
+                        for (int j = 0; j < isModelReadyList.size(); j++) {
+                            readyArr[j] = isModelReadyList.get(j);
+                        }
+                        onModelContextsUpdated(
+                                modelsToRemove.isEmpty() ? null : modelsToRemove.toArray(new String[0]),
+                                previousModelIds.isEmpty() ? null : previousModelIds.toArray(new String[0]),
+                                updatedModelIds.isEmpty() ? null : updatedModelIds.toArray(new String[0]),
+                                readyArr
+                        );
+                        YesSteveModel.LOGGER.info("[SM] Cleaned up {} outdated models and updated {} existing models during sync.", modelsToRemove.size(), previousModelIds.size());
+                    }
 
-        try (YSMByteBuf outBuf = new YSMByteBuf(Unpooled.buffer())) {
-            outBuf.writeGarbageHeader(garbageLen, garbage);
-            outBuf.getRawBuf().writeByte(0x04);
+                    syncStep = 3;
+                    markSyncActivity();
 
-            outBuf.writeVarInt(modelsToRequest.size());
-            for (ModelHash h : modelsToRequest) {
-                outBuf.writeVarLong(h.hash1);
-                outBuf.writeVarLong(h.hash2);
-            }
+                    int garbageLen = 16 + SECURE_RANDOM.nextInt(48);
+                    byte[] garbage = new byte[garbageLen];
+                    SECURE_RANDOM.nextBytes(garbage);
 
-            YsmCrypt.EncryptedPacket result = YsmCrypt.encrypt(outBuf.toArray(), key1, false);
-            sendModelFile(ByteBuffer.wrap(result.data()));
-        }
+                    try (YSMByteBuf outBuf = new YSMByteBuf(Unpooled.buffer())) {
+                        outBuf.writeGarbageHeader(garbageLen, garbage);
+                        outBuf.getRawBuf().writeByte(0x04);
 
-        syncManifestProcessed = true;
-        scheduleSyncCompleteIfReady();
+                        outBuf.writeVarInt(modelsToRequest.size());
+                        for (ModelHash h : modelsToRequest) {
+                            outBuf.writeVarLong(h.hash1);
+                            outBuf.writeVarLong(h.hash2);
+                        }
+
+                        YsmCrypt.EncryptedPacket result = YsmCrypt.encrypt(outBuf.toArray(), key1, false);
+                        sendModelFile(ByteBuffer.wrap(result.data()));
+                    }
+
+                syncManifestProcessed = true;
+                scheduleSyncCompleteIfReady();
+                } catch (Exception e) {
+                    YesSteveModel.LOGGER.error("[SM] Failed to finish model sync on main thread", e);
+                }
+            });
+        });
     }
 
     private static void handlePacket05(YSMByteBuf buf) throws Exception {
@@ -1267,6 +1320,7 @@ public class ClientModelManager {
                 }
                 ((Executor) Minecraft.getInstance()).execute(() -> {
                     flushPendingModels();
+                    ClientRenderCompatibilityRegistry.flush();
                     forEachGuiWidget(guiWidget -> guiWidget.onModelsUpdated(modelAssemblyMap));
                 });
                 if (restoreSelection) {
@@ -1581,6 +1635,9 @@ public class ClientModelManager {
         if (lower.endsWith(".bbmodel")) {
             return parseBbModelImport(data, fileName);
         }
+        if (lower.endsWith(".geo.json") || lower.endsWith("geometry.json")) {
+            return parseBedrockGeoImport(data, fileName);
+        }
         throw new IllegalArgumentException("Unsupported model import type: " + fileName);
     }
 
@@ -1632,6 +1689,10 @@ public class ClientModelManager {
                 break;
         }
 
+        if (sniff.kind == com.micaftic.morpher.resource.bbmodel.ZipModelSniffer.Kind.BEDROCK_PACK) {
+            return parseBedrockPackImport(sniff);
+        }
+
         // 落到这里：YSM_FOLDER 或 UNKNOWN（让 YSMFolderDeserializer 处理 / 报错）
         Path temp = Files.createTempFile("ysm-local-import-", ".zip");
         try {
@@ -1648,7 +1709,149 @@ public class ClientModelManager {
         }
     }
 
-    private static RawYsmModel parseBbModelImport(byte[] data, String source) throws Exception {
+    private static RawYsmModel parseBedrockGeoImport(byte[] data, String fileName) throws Exception {
+        String identifier = bedrockIdentifierFromFileName(fileName);
+        YesSteveModel.LOGGER.info("[SM] Importing Bedrock geometry file {} (identifier={})", fileName, identifier);
+        RawYsmModel.RawGeometry geometry = YSMFolderDeserializer.parseBedrockGeometry(data, identifier);
+        if (geometry == null || geometry.bones.isEmpty()) {
+            throw new IllegalArgumentException("Invalid Bedrock geometry: " + fileName);
+        }
+        RawYsmModel raw = assembleBedrockModel(geometry, null, null);
+        normalizeBedrockCase(raw);
+        raw.properties.sha256 = com.micaftic.morpher.resource.bbmodel.BBToRawConverter.importCacheSha256(data);
+        return raw;
+    }
+
+    private static RawYsmModel parseBedrockPackImport(com.micaftic.morpher.resource.bbmodel.ZipModelSniffer sniff) throws Exception {
+        String identifier = bedrockIdentifierFromFileName(sniff.bedrockGeoPath);
+        YesSteveModel.LOGGER.info("[SM] Detected Bedrock pack (geo={}, textures={}, animations={})",
+                sniff.bedrockGeoPath, sniff.sideTextures.size(), sniff.bedrockAnimations.size());
+        RawYsmModel.RawGeometry geometry = YSMFolderDeserializer.parseBedrockGeometry(sniff.bedrockGeoBytes, identifier);
+        if (geometry == null || geometry.bones.isEmpty()) {
+            throw new IllegalArgumentException("Invalid Bedrock pack (no usable geometry): " + sniff.bedrockGeoPath);
+        }
+
+        Map<String, RawYsmModel.RawTexture> textures = new LinkedHashMap<>();
+        for (Map.Entry<String, byte[]> entry : sniff.sideTextures.entrySet()) {
+            RawYsmModel.RawTexture texture = YSMFolderDeserializer.parseBedrockTexture(entry.getValue(), entry.getKey());
+            if (texture.data != null) {
+                textures.put(entry.getKey(), texture);
+            }
+        }
+
+        Map<String, RawYsmModel.RawAnimationFile> animationFiles = new LinkedHashMap<>();
+        int index = 0;
+        for (Map.Entry<String, byte[]> entry : sniff.bedrockAnimations.entrySet()) {
+            try {
+                RawYsmModel.RawAnimationFile animationFile = YSMFolderDeserializer.parseAnimationFile(entry.getValue());
+                if (!animationFile.animations.isEmpty()) {
+                    animationFiles.put("bedrock-anim-" + (index++), animationFile);
+                }
+            } catch (Exception e) {
+                YesSteveModel.LOGGER.warn("[SM] Failed to parse Bedrock animation {}: {}", entry.getKey(), e.toString());
+            }
+        }
+
+        animationFiles = BedrockAnimationMapping.remapToActions(animationFiles);
+        RawYsmModel raw = assembleBedrockModel(geometry, textures, animationFiles);
+        normalizeBedrockCase(raw);
+        raw.properties.sha256 = com.micaftic.morpher.resource.bbmodel.BBToRawConverter.importCacheSha256(sniff.bedrockGeoBytes);
+        return raw;
+    }
+
+    /** 组装 Bedrock 直读模型：几何 + 可选纹理 + 可选动画，属性对齐 bbmodel 导入（scale=1）。 */
+    private static RawYsmModel assembleBedrockModel(RawYsmModel.RawGeometry geometry,
+                                                    Map<String, RawYsmModel.RawTexture> textures,
+                                                    Map<String, RawYsmModel.RawAnimationFile> animationFiles) {
+        RawYsmModel raw = new RawYsmModel();
+        raw.modelId = (geometry.identifier == null || geometry.identifier.isEmpty()) ? "bedrock" : geometry.identifier;
+        raw.formatVersion = 65535;
+        raw.metadata = new RawYsmModel.RawMetadata();
+        raw.properties = new RawYsmModel.RawProperties();
+        raw.properties.widthScale = 1.0f;
+        raw.properties.heightScale = 1.0f;
+        raw.properties.defaultTexture = "default";
+
+        geometry.modelType = 1;
+        RawYsmModel.RawMainEntity mainEntity = new RawYsmModel.RawMainEntity();
+        mainEntity.mainModel = geometry;
+        if (textures != null) {
+            mainEntity.textures.putAll(textures);
+            if (!textures.isEmpty()) {
+                raw.properties.defaultTexture = textures.keySet().iterator().next();
+            }
+        }
+        if (animationFiles != null) {
+            mainEntity.animationFiles.putAll(animationFiles);
+        }
+        raw.mainEntity = mainEntity;
+        raw.footer = new RawYsmModel.RawFooter();
+        return raw;
+    }
+
+    /**
+     * Bedrock 导入边界大小写归一：骨名与动画骨名统一小写。
+     * 基岩版动画用小写（leftarm）、几何用驼峰（leftArm），
+     * 这里在入口处把两者归一为小写以便动画绑定；
+     * 仅在 Bedrock 入口生效，不影响 YSM/内置模型路径。
+     */
+    private static void normalizeBedrockCase(RawYsmModel raw) {
+        if (raw == null || raw.mainEntity == null) {
+            return;
+        }
+        Map<String, String> rename = new HashMap<>();
+        RawYsmModel.RawGeometry geometry = raw.mainEntity.mainModel;
+        if (geometry != null && geometry.bones != null) {
+            for (RawYsmModel.RawBone bone : geometry.bones) {
+                if (bone.name == null || bone.name.isEmpty()) continue;
+                String lower = bone.name.toLowerCase(Locale.ROOT);
+                if (!lower.equals(bone.name)) {
+                    rename.put(bone.name, lower);
+                }
+            }
+            for (RawYsmModel.RawBone bone : geometry.bones) {
+                if (bone.name != null) {
+                    bone.name = rename.getOrDefault(bone.name, bone.name);
+                }
+                if (bone.parentName != null) {
+                    bone.parentName = rename.getOrDefault(bone.parentName, bone.parentName);
+                }
+            }
+        }
+        for (RawYsmModel.RawAnimationFile animationFile : raw.mainEntity.animationFiles.values()) {
+            if (animationFile == null || animationFile.animations == null) continue;
+            for (RawYsmModel.RawAnimation animation : animationFile.animations.values()) {
+                if (animation == null || animation.boneAnimations == null) continue;
+                for (RawYsmModel.RawBoneAnimation boneAnimation : animation.boneAnimations) {
+                    if (boneAnimation != null && boneAnimation.boneName != null) {
+                        boneAnimation.boneName = boneAnimation.boneName.toLowerCase(Locale.ROOT);
+                    }
+                }
+            }
+        }
+    }
+
+    /** 从文件名推导 Bedrock 几何 identifier：去掉 .geo.json / geometry.json 后缀后的文件名。 */
+    private static String bedrockIdentifierFromFileName(String fileName) {
+        if (fileName == null || fileName.isEmpty()) return null;
+        String lower = fileName.toLowerCase(Locale.ROOT);
+        String base;
+        if (lower.endsWith(".geo.json")) {
+            base = fileName.substring(0, fileName.length() - ".geo.json".length());
+        } else if (lower.endsWith("geometry.json")) {
+            base = fileName.substring(0, fileName.length() - "geometry.json".length());
+        } else {
+            base = fileName;
+        }
+        int slash = Math.max(base.lastIndexOf('/'), base.lastIndexOf('\\'));
+        if (slash >= 0) {
+            base = base.substring(slash + 1);
+        }
+        base = base.trim();
+        return base.isEmpty() ? null : base;
+    }
+
+private static RawYsmModel parseBbModelImport(byte[] data, String source) throws Exception {
         try {
             String json = new String(data, java.nio.charset.StandardCharsets.UTF_8);
             com.micaftic.morpher.resource.bbmodel.BBModelFile bbmodel = com.micaftic.morpher.resource.bbmodel.BBModelParser.parse(json);
@@ -1694,6 +1897,10 @@ public class ClientModelManager {
                     return FileVisitResult.CONTINUE;
                 }
                 try {
+                    if (attrs.size() > MAX_LOCAL_MODEL_FILE_BYTES) {
+                        YesSteveModel.LOGGER.warn("[SM] Skipping oversized local model file ({} bytes): {}", attrs.size(), file);
+                        return FileVisitResult.CONTINUE;
+                    }
                     String modelId = stripImportExtension(normalizeLocalModelId(baseDir.relativize(file).toString()));
                     registerLocalCatalogEntry(catalog, modelId, file, isAuth);
                     rememberLocalModelSource(baseDir, modelId, file);
@@ -1747,7 +1954,7 @@ public class ClientModelManager {
             String fileName = sourcePath.getFileName() == null ? "" : sourcePath.getFileName().toString();
             String lower = fileName.toLowerCase(Locale.ROOT);
             if (lower.endsWith(".bbmodel")) {
-                return parseBbmodelRootName(Files.readString(sourcePath, StandardCharsets.UTF_8));
+                return parseBbmodelRootName(readJsonHead(sourcePath));
             }
             if (lower.endsWith(".zip")) {
                 return sniffNameFromZip(sourcePath);
@@ -1763,6 +1970,13 @@ public class ClientModelManager {
     @Nullable
     private static String sniffNameFromZip(Path zipPath) {
         try (ZipFile zip = new ZipFile(zipPath.toFile())) {
+            // 常见布局:ysm.json 直接位于 zip 根目录 —— 用 getEntry 直取,避免遍历全部条目。
+            ZipEntry rootEntry = zip.getEntry("ysm.json");
+            if (rootEntry != null && !rootEntry.isDirectory()) {
+                String parsed = readNameFromZipEntry(zip, rootEntry);
+                if (StringUtils.isNotBlank(parsed)) return parsed;
+            }
+            // 兼容 ysm.json 位于子目录的布局。
             Enumeration<? extends ZipEntry> entries = zip.entries();
             while (entries.hasMoreElements()) {
                 ZipEntry entry = entries.nextElement();
@@ -1771,16 +1985,36 @@ public class ClientModelManager {
                 int slash = name.lastIndexOf('/');
                 String base = slash < 0 ? name : name.substring(slash + 1);
                 if (!"ysm.json".equalsIgnoreCase(base)) continue;
-                try (InputStream in = zip.getInputStream(entry)) {
-                    byte[] bytes = in.readAllBytes();
-                    String parsed = parseMetadataNameFromYsmJson(new String(bytes, StandardCharsets.UTF_8));
-                    if (StringUtils.isNotBlank(parsed)) return parsed;
-                }
+                String parsed = readNameFromZipEntry(zip, entry);
+                if (StringUtils.isNotBlank(parsed)) return parsed;
             }
         } catch (Exception e) {
             YesSteveModel.LOGGER.debug("[SM] Failed to sniff zip model name from {}", zipPath, e);
         }
         return null;
+    }
+
+    @Nullable
+    private static String readNameFromZipEntry(ZipFile zip, ZipEntry entry) {
+        try (InputStream in = zip.getInputStream(entry)) {
+            byte[] bytes = in.readAllBytes();
+            return parseMetadataNameFromYsmJson(new String(bytes, StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            YesSteveModel.LOGGER.debug("[SM] Failed to read ysm.json entry in zip", e);
+            return null;
+        }
+    }
+
+    /**
+     * 只读文件头部读取 JSON 文本 —— bbmodel 名称必然位于文件头部(meta/name 字段),
+     * 完整文件可能数 MB,截断读取可避免扫描大量模型时重复全量读盘。
+     * 若头部截断导致 JSON 不完整,解析失败时回退为文件名(由调用方兜底)。
+     */
+    private static String readJsonHead(Path path) throws IOException {
+        try (InputStream in = Files.newInputStream(path)) {
+            byte[] head = in.readNBytes(256 * 1024);
+            return new String(head, StandardCharsets.UTF_8);
+        }
     }
 
     @Nullable
@@ -1903,6 +2137,10 @@ public class ClientModelManager {
                 rawModel = deserializer.deserialize();
             }
         } else {
+            long size = Files.size(source.path);
+            if (size > MAX_LOCAL_MODEL_FILE_BYTES) {
+                throw new IOException("Local model file too large (" + size + " bytes), skipped: " + source.path);
+            }
             byte[] data = Files.readAllBytes(source.path);
             rawModel = parseImportModel(source.path.getFileName().toString(), data);
         }
@@ -2079,6 +2317,7 @@ public class ClientModelManager {
 
         ((Executor) Minecraft.getInstance()).execute(() -> {
             flushPendingModels();
+            ClientRenderCompatibilityRegistry.flush();
             syncState.finishSuccess();
             // 远端懒加载目录到此才完整，补做一次持久化选择恢复。
             restorePersistedModelSelection();
