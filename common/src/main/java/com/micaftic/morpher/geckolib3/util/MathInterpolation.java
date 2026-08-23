@@ -16,7 +16,10 @@ public class MathInterpolation {
         if (Math.sqrt((d * d) + (d2 * d2)) < 1.0E-4d) {
             return 0.0d;
         }
-        return Mth.cos(MathUtil.degreesToRadians(Mth.wrapDegrees(MathUtil.radiansToDegrees((float) Mth.atan2(d2, d)) - (90.0f - Mth.wrapDegrees(-entity.getViewYRot(frameTime))))));
+        float moveDirection = MathUtil.radiansToDegrees((float) Mth.atan2(d2, d));
+        float faceDirection = Mth.wrapDegrees(-entity.getViewYRot(frameTime));
+
+        return Mth.cos(MathUtil.degreesToRadians(Mth.wrapDegrees(moveDirection - (90.0f - faceDirection))));
     }
 
     public static double getPitchInterpolation(IContext<Entity> context) {

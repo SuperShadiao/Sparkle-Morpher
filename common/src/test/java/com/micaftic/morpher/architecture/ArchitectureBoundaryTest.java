@@ -42,7 +42,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 但<b>新增</b>的违规引用会使测试失败，从而把架构规则立起来（§4.7.2）。
  * 后续版本逐步收紧（§10.5 / R13）。
  */
-class ArchitectureBoundaryTest {
+class  ArchitectureBoundaryTest {
 
     private static final Pattern GL_REF = Pattern.compile("org/lwjgl/opengl/GL[A-Za-z0-9_$]*");
     private static final Pattern FABRIC_REF = Pattern.compile("net/fabricmc/fabric/[A-Za-z0-9_$]+");

@@ -312,7 +312,11 @@ public final class ModelPreviewRenderer {
         setPreviewMode(true);
         setExtraPlayerMode(extraPlayer || previousExtraPlayerMode);
         SubmitRenderContext.set(collector != null ? collector : previousCollector);
-        LivingEntity livingEntity = (LivingEntity) animatable.getEntity();
+        animatable.flagHudRendering(true);
+        LivingEntity livingEntity = animatable.getEntity().asLivingEntity();
+        if(livingEntity == null) {
+            throw new AssertionError();
+        }
         poseStack.pushPose();
         poseStack.translate(offsetX, offsetY, 0.0d);
         Quaternionf rotationZ = Axis.ZP.rotationDegrees(180.0f);
@@ -367,6 +371,7 @@ public final class ModelPreviewRenderer {
             renderer.renderEntity(animatable, 0.0f, partialTick, poseStack, bufferSource, 15728880);
             bufferSource.endBatch();
         } finally {
+            animatable.flagHudRendering(false);
             livingEntity.yBodyRot = oldBodyRot;
             livingEntity.yBodyRotO = oldBodyRotO;
             livingEntity.setYRot(oldYRot);

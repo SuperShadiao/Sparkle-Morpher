@@ -1,5 +1,6 @@
 package com.micaftic.morpher.geckolib3.core;
 
+import com.google.common.collect.ImmutableList;
 import com.micaftic.morpher.capability.PlayerCapability;
 import com.micaftic.morpher.client.animation.debug.AnimationFrameProfiler;
 import com.micaftic.morpher.client.render.RiderRotationMath;
@@ -28,26 +29,55 @@ import com.micaftic.morpher.geckolib3.core.util.RateLimiter;
 import com.micaftic.morpher.geckolib3.util.MovementQuery;
 import com.micaftic.morpher.util.log.ILogger;
 import com.google.common.collect.Maps;
+import com.mojang.authlib.GameProfile;
 import it.unimi.dsi.fastutil.objects.Object2ReferenceMap;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.multiplayer.PlayerInfo;
+import net.minecraft.client.player.AbstractClientPlayer;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.GlobalPos;
+import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundSource;
 import net.minecraft.util.Mth;
-import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.*;
+import net.minecraft.world.entity.animal.parrot.Parrot;
+import net.minecraft.world.entity.monster.warden.WardenSpawnTracker;
+import net.minecraft.world.entity.player.Abilities;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.entity.player.PlayerModelPart;
+import net.minecraft.world.entity.player.PlayerSkin;
+import net.minecraft.world.food.FoodData;
+import net.minecraft.world.inventory.PlayerEnderChestContainer;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemCooldowns;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.component.ResolvableProfile;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jspecify.annotations.NonNull;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 public abstract class AnimatableEntity<TEntity extends Entity> {
 
     private final EntityFrameStateTracker<TEntity> positionTracker;
 
     public final TEntity entity;
+
+    public final FakePlayerEntity fakePlayerEntity;
 
     private AnimatedGeoModel currentModel;
 
@@ -125,6 +155,12 @@ public abstract class AnimatableEntity<TEntity extends Entity> {
         this.entity = tentity;
         this.positionTracker = createPositionTracker(tentity);
         this.rateLimiter.setRefreshRate(getRefreshRate());
+
+        if(tentity instanceof LocalPlayer localPlayer) {
+            this.fakePlayerEntity = new FakePlayerEntity(localPlayer);
+        } else {
+            this.fakePlayerEntity = null;
+        }
     }
 
     public void reset() {
@@ -214,8 +250,14 @@ public abstract class AnimatableEntity<TEntity extends Entity> {
     public void afterSetupAnim(float seekTime, boolean z) {
     }
 
+    private boolean isHudRendering = false;
+
+    public void flagHudRendering(boolean flag) {
+        this.isHudRendering = flag;
+    }
+
     public final TEntity getEntity() {
-        return this.entity;
+        return isHudRendering && fakePlayerEntity != null ? (TEntity) fakePlayerEntity : this.entity;
     }
 
     public boolean hasCustomTexture() {
@@ -539,4 +581,489 @@ public abstract class AnimatableEntity<TEntity extends Entity> {
     public AnimationState getAnimationState(String name) {
         return this.animationStates.getOrDefault(name, AnimationState.IDLE);
     }
+
+    public static class FakePlayerEntity extends AbstractClientPlayer {
+
+        private final LocalPlayer targetPlayer;
+
+        public FakePlayerEntity(LocalPlayer target) {
+            this.targetPlayer = target;
+            super((ClientLevel) target.level(), target.getGameProfile());
+        }
+
+        public void clonePositionAndRotation() {
+            clonePositionAndRotation(this.targetPlayer);
+        }
+
+        public void clonePositionAndRotation(AbstractClientPlayer srcPlayer) {
+
+            yRotO = srcPlayer.yRotO;
+            xRotO = srcPlayer.xRotO;
+            yBodyRotO = srcPlayer.yBodyRotO;
+            yHeadRotO = srcPlayer.yHeadRotO;
+
+            setPos(srcPlayer.getX(), srcPlayer.getY(), srcPlayer.getZ());
+            setYRot(srcPlayer.getYRot());
+            setYHeadRot(srcPlayer.getYHeadRot());
+            setYBodyRot(srcPlayer.getYHeadRot());
+            setXRot(srcPlayer.getXRot());
+
+        }
+
+        public @NonNull ItemStack getItemBySlot(EquipmentSlot slot) {
+            return this.targetPlayer.getItemBySlot(slot);
+        }
+
+        @Override
+        public PlayerSkin getSkin() {
+            return this.targetPlayer.getSkin();
+        }
+
+        @Override
+        public Parrot.@org.jspecify.annotations.Nullable Variant getParrotVariantOnShoulder(boolean left) {
+            return this.targetPlayer.getParrotVariantOnShoulder(left);
+        }
+
+        @Override
+        public float getFieldOfViewModifier(boolean firstPerson, float effectScale) {
+            return this.targetPlayer.getFieldOfViewModifier(firstPerson, effectScale);
+        }
+
+        @Override
+        public int getDimensionChangingDelay() {
+            return this.targetPlayer.getDimensionChangingDelay();
+        }
+
+        @Override
+        public SoundSource getSoundSource() {
+            return this.targetPlayer.getSoundSource();
+        }
+
+        @Override
+        public int getScore() {
+            return this.targetPlayer.getScore();
+        }
+
+        @Override
+        public ItemStack getWeaponItem() {
+            return this.targetPlayer.getWeaponItem();
+        }
+
+        @Override
+        public float getDestroySpeed(BlockState state) {
+            return this.targetPlayer.getDestroySpeed(state);
+        }
+
+        @Override
+        public float getVoicePitch() {
+            return this.targetPlayer.getVoicePitch();
+        }
+
+        @Override
+        public GameProfile getGameProfile() {
+            return this.targetPlayer.getGameProfile();
+        }
+
+        @Override
+        public Inventory getInventory() {
+            return this.targetPlayer.getInventory();
+        }
+
+        @Override
+        public Abilities getAbilities() {
+            return this.targetPlayer.getAbilities();
+        }
+
+        @Override
+        public int getSleepTimer() {
+            return this.targetPlayer.getSleepTimer();
+        }
+
+        @Override
+        public float getSpeed() {
+            return this.targetPlayer.getSpeed();
+        }
+
+        @Override
+        public Fallsounds getFallSounds() {
+            return this.targetPlayer.getFallSounds();
+        }
+
+        @Override
+        public int getEnchantmentSeed() {
+            return this.targetPlayer.getEnchantmentSeed();
+        }
+
+        @Override
+        public int getXpNeededForNextLevel() {
+            return this.targetPlayer.getXpNeededForNextLevel();
+        }
+
+        @Override
+        public Optional<WardenSpawnTracker> getWardenSpawnTracker() {
+            return this.targetPlayer.getWardenSpawnTracker();
+        }
+
+        @Override
+        public FoodData getFoodData() {
+            return this.targetPlayer.getFoodData();
+        }
+
+        @Override
+        public Component getName() {
+            return this.targetPlayer.getName();
+        }
+
+        @Override
+        public String getPlainTextName() {
+            return this.targetPlayer.getPlainTextName();
+        }
+
+        @Override
+        public PlayerEnderChestContainer getEnderChestInventory() {
+            return this.targetPlayer.getEnderChestInventory();
+        }
+
+        @Override
+        public Component getDisplayName() {
+            return this.targetPlayer.getDisplayName();
+        }
+
+        @Override
+        public String getScoreboardName() {
+            return this.targetPlayer.getScoreboardName();
+        }
+
+        @Override
+        public float getAbsorptionAmount() {
+            return this.targetPlayer.getAbsorptionAmount();
+        }
+
+        @Override
+        public @org.jspecify.annotations.Nullable SlotAccess getSlot(int slot) {
+            return this.targetPlayer.getSlot(slot);
+        }
+
+        @Override
+        public Optional<Parrot.Variant> getShoulderParrotLeft() {
+            return this.targetPlayer.getShoulderParrotLeft();
+        }
+
+        @Override
+        public Optional<Parrot.Variant> getShoulderParrotRight() {
+            return this.targetPlayer.getShoulderParrotRight();
+        }
+
+        @Override
+        public float getCurrentItemAttackStrengthDelay() {
+            return this.targetPlayer.getCurrentItemAttackStrengthDelay();
+        }
+
+        @Override
+        public float getAttackStrengthScale(float a) {
+            return this.targetPlayer.getAttackStrengthScale(a);
+        }
+
+        @Override
+        public float getItemSwapScale(float a) {
+            return this.targetPlayer.getItemSwapScale(a);
+        }
+
+        @Override
+        public ItemCooldowns getCooldowns() {
+            return this.targetPlayer.getCooldowns();
+        }
+
+        @Override
+        public float getLuck() {
+            return this.targetPlayer.getLuck();
+        }
+
+        @Override
+        public ImmutableList<Pose> getDismountPoses() {
+            return this.targetPlayer.getDismountPoses();
+        }
+
+        @Override
+        public ItemStack getProjectile(ItemStack heldWeapon) {
+            return this.targetPlayer.getProjectile(heldWeapon);
+        }
+
+        @Override
+        public Vec3 getRopeHoldPosition(float partialTickTime) {
+            return this.targetPlayer.getRopeHoldPosition(partialTickTime);
+        }
+
+        @Override
+        public Optional<GlobalPos> getLastDeathLocation() {
+            return this.targetPlayer.getLastDeathLocation();
+        }
+
+        @Override
+        public float getHurtDir() {
+            return this.targetPlayer.getHurtDir();
+        }
+
+        @Override
+        public double getContainerInteractionRange() {
+            return this.targetPlayer.getContainerInteractionRange();
+        }
+
+        @Override
+        public ResolvableProfile getProfile() {
+            return this.targetPlayer.getProfile();
+        }
+
+        @Override
+        public boolean isSecondaryUseActive() {
+            return this.targetPlayer.isSecondaryUseActive();
+        }
+
+        @Override
+        public boolean isInvulnerableTo(ServerLevel level, DamageSource source) {
+            return this.targetPlayer.isInvulnerableTo(level, source);
+        }
+
+        @Override
+        public boolean isTextFilteringEnabled() {
+            return this.targetPlayer.isTextFilteringEnabled();
+        }
+
+        @Override
+        public boolean isAffectedByFluids() {
+            return this.targetPlayer.isAffectedByFluids();
+        }
+
+        @Override
+        public boolean isClientAuthoritative() {
+            return this.targetPlayer.isClientAuthoritative();
+        }
+
+        @Override
+        public boolean isLocalPlayer() {
+            return this.targetPlayer.isLocalPlayer();
+        }
+
+        @Override
+        public boolean isEffectiveAi() {
+            return this.targetPlayer.isEffectiveAi();
+        }
+
+        @Override
+        public boolean isSleepingLongEnough() {
+            return this.targetPlayer.isSleepingLongEnough();
+        }
+
+        @Override
+        public boolean isHurt() {
+            return this.targetPlayer.isHurt();
+        }
+
+        @Override
+        public boolean isSpectator() {
+            return this.targetPlayer.isSpectator();
+        }
+
+        @Override
+        public boolean isPickable() {
+            return this.targetPlayer.isPickable();
+        }
+
+        @Override
+        public boolean isSwimming() {
+            return this.targetPlayer.isSwimming();
+        }
+
+        @Override
+        public boolean isCreative() {
+            return this.targetPlayer.isCreative();
+        }
+
+        @Override
+        public boolean isPushedByFluid() {
+            return this.targetPlayer.isPushedByFluid();
+        }
+
+        @Override
+        public boolean isReducedDebugInfo() {
+            return this.targetPlayer.isReducedDebugInfo();
+        }
+
+        @Override
+        public boolean isAlwaysTicking() {
+            return this.targetPlayer.isAlwaysTicking();
+        }
+
+        @Override
+        public boolean isScoping() {
+            return this.targetPlayer.isScoping();
+        }
+
+        @Override
+        public boolean isMobilityRestricted() {
+            return this.targetPlayer.isMobilityRestricted();
+        }
+
+        @Override
+        public boolean isWithinEntityInteractionRange(Entity entity, double buffer) {
+            return this.targetPlayer.isWithinEntityInteractionRange(entity, buffer);
+        }
+
+        @Override
+        public boolean isWithinEntityInteractionRange(AABB aabb, double buffer) {
+            return this.targetPlayer.isWithinEntityInteractionRange(aabb, buffer);
+        }
+
+        @Override
+        public boolean isWithinAttackRange(ItemStack weaponItem, AABB aabb, double buffer) {
+            return this.targetPlayer.isWithinAttackRange(weaponItem, aabb, buffer);
+        }
+
+        @Override
+        public boolean isWithinBlockInteractionRange(BlockPos pos, double buffer) {
+            return this.targetPlayer.isWithinBlockInteractionRange(pos, buffer);
+        }
+
+        @Override
+        public boolean isBaby() {
+            return this.targetPlayer.isBaby();
+        }
+
+        @Override
+        public boolean isInvertedHealAndHarm() {
+            return this.targetPlayer.isInvertedHealAndHarm();
+        }
+
+        @Override
+        public boolean isDeadOrDying() {
+            return this.targetPlayer.isDeadOrDying();
+        }
+
+        @Override
+        public boolean isAlive() {
+            return this.targetPlayer.isAlive();
+        }
+
+        @Override
+        public boolean isLookingAtMe(LivingEntity target, double coneSize, boolean adjustForDistance, boolean seeThroughTransparentBlocks, double... gazeHeights) {
+            return this.targetPlayer.isLookingAtMe(target, coneSize, adjustForDistance, seeThroughTransparentBlocks, gazeHeights);
+        }
+
+        @Override
+        public boolean isIgnoringFallDamageFromCurrentImpulse() {
+            return this.targetPlayer.isIgnoringFallDamageFromCurrentImpulse();
+        }
+
+        @Override
+        public boolean isInPostImpulseGraceTime() {
+            return this.targetPlayer.isInPostImpulseGraceTime();
+        }
+
+        @Override
+        public boolean isHolding(Item item) {
+            return this.targetPlayer.isHolding(item);
+        }
+
+        @Override
+        public boolean isHolding(Predicate<ItemStack> itemPredicate) {
+            return this.targetPlayer.isHolding(itemPredicate);
+        }
+
+        @Override
+        public boolean isSensitiveToWater() {
+            return this.targetPlayer.isSensitiveToWater();
+        }
+
+        @Override
+        public boolean isJumping() {
+            return this.targetPlayer.isJumping();
+        }
+
+        @Override
+        public boolean isAutoSpinAttack() {
+            return this.targetPlayer.isAutoSpinAttack();
+        }
+
+        @Override
+        public boolean isPushable() {
+            return this.targetPlayer.isPushable();
+        }
+
+        @Override
+        public boolean isUsingItem() {
+            return this.targetPlayer.isUsingItem();
+        }
+
+        @Override
+        public boolean isBlocking() {
+            return this.targetPlayer.isBlocking();
+        }
+
+        @Override
+        public boolean isSuppressingSlidingDownLadder() {
+            return this.targetPlayer.isSuppressingSlidingDownLadder();
+        }
+
+        @Override
+        public boolean isFallFlying() {
+            return this.targetPlayer.isFallFlying();
+        }
+
+        @Override
+        public boolean isVisuallySwimming() {
+            return this.targetPlayer.isVisuallySwimming();
+        }
+
+        @Override
+        public boolean isAffectedByPotions() {
+            return this.targetPlayer.isAffectedByPotions();
+        }
+
+        @Override
+        public boolean isSleeping() {
+            return this.targetPlayer.isSleeping();
+        }
+
+        @Override
+        public boolean isInWall() {
+            return this.targetPlayer.isInWall();
+        }
+
+        @Override
+        public boolean isCurrentlyGlowing() {
+            return this.targetPlayer.isCurrentlyGlowing();
+        }
+
+        @Override
+        public boolean isTransmittingWaypoint() {
+            return this.targetPlayer.isTransmittingWaypoint();
+        }
+
+        @Override
+        public boolean isModelPartShown(PlayerModelPart part) {
+            return this.targetPlayer.isModelPartShown(part);
+        }
+
+        @Override
+        public boolean isColliding(BlockPos pos, BlockState state) {
+            return this.targetPlayer.isColliding(pos, state);
+        }
+
+        @Override
+        public boolean isOnPortalCooldown() {
+            return this.targetPlayer.isOnPortalCooldown();
+        }
+
+        @Override
+        public boolean isFree(double xa, double ya, double za) {
+            return this.targetPlayer.isFree(xa, ya, za);
+        }
+
+        @Override
+        public boolean isSupportedBy(BlockPos pos) {
+            return this.targetPlayer.isSupportedBy(pos);
+        }
+
+    }
+
 }
